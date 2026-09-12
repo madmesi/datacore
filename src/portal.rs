@@ -918,7 +918,7 @@ async fn trigger_dag_handler(
     }
 }
 
-const PORTAL_HTML: &str = r#"
+const PORTAL_HTML: &str = r###"
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1421,12 +1421,13 @@ const PORTAL_HTML: &str = r#"
 
       apps.forEach(a => {
         const isRunning = a.status === 'RUNNING';
+        const statusBadgeClass = isRunning ? 'badge-sql' : 'badge-iceberg';
         tbody.innerHTML += `<tr>
           <td><code>${a.app_id}</code></td>
           <td>${a.app_name}</td>
           <td><span class="badge badge-ldap">doAs: ${a.impersonated_do_as_user}</span></td>
           <td>${a.executor_count}x (${a.memory_per_executor_mb}MB)</td>
-          <td><span class="badge ${isRunning ? 'badge-sql' : 'badge-iceberg'}">${a.status}</span></td>
+          <td><span class="badge ${statusBadgeClass}">${a.status}</span></td>
           <td>${isRunning ? `<button onclick="terminateSparkApp('${a.app_id}')" style="background:var(--danger); padding:4px 8px; font-size:11px;">Stop</button>` : '-'}</td>
         </tr>`;
       });
@@ -1501,4 +1502,4 @@ const PORTAL_HTML: &str = r#"
   </script>
 </body>
 </html>
-"#;
+"###;
