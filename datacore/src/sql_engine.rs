@@ -73,20 +73,22 @@ impl SqlEngine {
         let start = std::time::Instant::now();
         let ctx = self.ctx.lock().await;
 
-        let df_res = ctx.sql(sql).await;
-        if let Err(e) = df_res {
-            self.metrics.queries_total.with_label_values(&["error"]).inc();
-            return Err(format!("SQL Compilation error: {e}"));
-        }
+        let df = match ctx.sql(sql).await {
+            Ok(df) => df,
+            Err(e) => {
+                self.metrics.queries_total.with_label_values(&["error"]).inc();
+                return Err(format!("SQL compilation error: {e}"));
+            }
+        };
 
-        let df = df_res.unwrap();
-        let batches_res = df.collect().await;
-        if let Err(e) = batches_res {
-            self.metrics.queries_total.with_label_values(&["error"]).inc();
-            return Err(format!("Execution error: {e}"));
-        }
+        let batches = match df.collect().await {
+            Ok(b) => b,
+            Err(e) => {
+                self.metrics.queries_total.with_label_values(&["error"]).inc();
+                return Err(format!("Execution error: {e}"));
+            }
+        };
 
-        let batches = batches_res.unwrap();
         let elapsed_secs = start.elapsed().as_secs_f64();
         let elapsed_ms = (elapsed_secs * 1000.0) as u128;
 

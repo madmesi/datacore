@@ -1,5 +1,6 @@
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -260,7 +261,7 @@ async fn metrics_handler(State(state): State<Arc<PortalState>>) -> Response {
 }
 
 async fn grafana_health_handler() -> impl IntoResponse {
-    axum::http::StatusCode::OK
+    StatusCode::OK
 }
 
 async fn grafana_search_handler(
@@ -342,20 +343,20 @@ async fn commit_iceberg_snapshot_handler(
                         vec!["iceberg", "commit"],
                     ).await;
 
-                    Json(serde_json::json!({
+                    (StatusCode::OK, Json(serde_json::json!({
                         "status": "success",
                         "message": format!("Committed snapshot {} to HDFS", snapshot.snapshot_id),
                         "snapshot": snapshot,
                         "parquet_file": file_path
-                    }))
+                    }))).into_response()
                 }
-                Err(e) => Json(serde_json::json!({ "status": "error", "message": e })),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": e }))).into_response(),
             }
         }
-        Err(e) => Json(serde_json::json!({
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "status": "error",
             "message": format!("Failed writing Parquet data file: {e}")
-        })),
+        }))).into_response(),
     }
 }
 
@@ -380,7 +381,7 @@ async fn iceberg_cleanup_handler(
                 vec!["iceberg", "gc"],
             ).await;
 
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "message": format!(
                     "Pruned {} snapshot(s), deleted {} orphan Parquet file(s), reclaimed {} bytes",
@@ -389,12 +390,12 @@ async fn iceberg_cleanup_handler(
                     report.reclaimed_bytes
                 ),
                 "report": report
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "status": "error",
             "message": e
-        })),
+        }))).into_response(),
     }
 }
 
@@ -428,19 +429,19 @@ async fn iceberg_compaction_handler(
                 )
                 .await;
 
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "message": format!(
                     "Consolidated {} fragmented files into 1 optimal block at {}",
                     report.files_merged_count, report.new_file_path
                 ),
                 "report": report
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "status": "error",
             "message": e
-        })),
+        }))).into_response(),
     }
 }
 
@@ -461,15 +462,15 @@ async fn write_parquet_hdfs_handler(
         Ok(bytes_written) => {
             state.telemetry.hdfs_storage_bytes.add(bytes_written as i64);
             let owner_name = payload.do_as_user.unwrap_or_else(|| "spark_service".to_string());
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "message": format!("Wrote {} bytes of Parquet data to HDFS at {} with owner '{}'", bytes_written, payload.path, owner_name)
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "status": "error",
             "message": e.to_string()
-        })),
+        }))).into_response(),
     }
 }
 
@@ -485,24 +486,24 @@ async fn read_hdfs_file_handler(
                 match state.hdfs.read_parquet(&query.path).await {
                     Ok(batches) => {
                         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                        Json(serde_json::json!({
+                        (StatusCode::OK, Json(serde_json::json!({
                             "status": "success",
                             "type": "parquet",
                             "summary": format!("Decoded {} Parquet record batch(es) with {} total rows", batches.len(), total_rows)
-                        }))
+                        }))).into_response()
                     }
-                    Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": e.to_string() }))).into_response(),
                 }
             } else {
                 let content = String::from_utf8_lossy(&bytes).to_string();
-                Json(serde_json::json!({
+                (StatusCode::OK, Json(serde_json::json!({
                     "status": "success",
                     "type": "text/metadata",
                     "content": content
-                }))
+                }))).into_response()
             }
         }
-        Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
+        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "status": "error", "message": e.to_string() }))).into_response(),
     }
 }
 
@@ -513,15 +514,15 @@ async fn execute_sql_handler(
     match state.sql_engine.execute_query(&payload.query).await {
         Ok(res) => {
             state.grafana_tsdb.record("query_latency_ms", res.execution_time_ms as f64).await;
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "data": res
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "status": "error",
             "message": e
-        })),
+        }))).into_response(),
     }
 }
 
@@ -532,7 +533,7 @@ async fn ldap_login_handler(
     match state.security.authenticate(&payload.username, &payload.password).await {
         Ok(identity) => {
             state.telemetry.ldap_auth_attempts.with_label_values(&["success"]).inc();
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "message": format!("Authenticated DN for {}", identity.username),
                 "identity": {
@@ -542,14 +543,14 @@ async fn ldap_login_handler(
                     "groups": identity.groups,
                     "token": identity.session_token
                 }
-            }))
+            }))).into_response()
         }
         Err(e) => {
             state.telemetry.ldap_auth_attempts.with_label_values(&["failure"]).inc();
-            Json(serde_json::json!({
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
                 "status": "error",
                 "message": e.to_string()
-            }))
+            }))).into_response()
         }
     }
 }
@@ -569,15 +570,15 @@ async fn apply_policy_handler(
     Json(payload): Json<ApplyPolicyRequest>,
 ) -> impl IntoResponse {
     match state.security.admission.apply_policy_yaml(&payload.yaml).await {
-        Ok(pol) => Json(serde_json::json!({
+        Ok(pol) => (StatusCode::OK, Json(serde_json::json!({
             "status": "success",
             "message": format!("Successfully applied ClusterPolicy '{}'", pol.metadata.name),
             "policy": pol
-        })),
-        Err(e) => Json(serde_json::json!({
+        }))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "status": "error",
             "message": e
-        })),
+        }))).into_response(),
     }
 }
 
@@ -609,15 +610,15 @@ async fn generate_db_creds_handler(
                 vec!["vault", "postgres", "security"],
             ).await;
 
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "credential": cred
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "status": "error",
             "message": e
-        })),
+        }))).into_response(),
     }
 }
 
@@ -633,15 +634,15 @@ async fn revoke_db_creds_handler(
                 vec!["vault", "postgres", "revoke"],
             ).await;
 
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "message": msg
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({
+        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "status": "error",
             "message": e
-        })),
+        }))).into_response(),
     }
 }
 
@@ -671,10 +672,10 @@ async fn bootstrap_spark_handler(
     };
     let decision = state.security.admission.validate_spark_job(&admission_req).await;
     if !decision.allowed {
-        return Json(serde_json::json!({
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
             "status": "error",
             "message": format!("Rejected by Admission Policy: {:?}", decision.violations)
-        }));
+        }))).into_response();
     }
 
     let krb_principal = "spark/analytics.cluster.local@CORP.INTERNAL";
@@ -702,13 +703,13 @@ async fn bootstrap_spark_handler(
                 )
                 .await;
 
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "message": format!("SparkContext initialized on Py4J port 25333 with doAs='{}'", app.impersonated_do_as_user),
                 "app": app
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({ "status": "error", "message": e })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": e }))).into_response(),
     }
 }
 
@@ -724,11 +725,11 @@ async fn terminate_spark_app_handler(
     Json(payload): Json<TerminateAppRequest>,
 ) -> impl IntoResponse {
     match state.py4j.complete_app(&payload.app_id).await {
-        Ok(_) => Json(serde_json::json!({
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({
             "status": "success",
             "message": format!("Halted SparkContext {}", payload.app_id)
-        })),
-        Err(e) => Json(serde_json::json!({ "status": "error", "message": e })),
+        }))).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "status": "error", "message": e }))).into_response(),
     }
 }
 
@@ -773,13 +774,13 @@ async fn roll_kms_key_handler(
                 vec!["kms", "tde", "key-rotation", "compliance"],
             ).await;
 
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "message": format!("Rotated key '{}' to new active version '{}'", new_key.key_name, new_key.version),
                 "key": new_key
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": e.to_string() }))).into_response(),
     }
 }
 
@@ -795,13 +796,13 @@ async fn reencrypt_zone_handler(
                 vec!["kms", "tde", "reencrypt", "compliance"],
             ).await;
 
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "message": format!("Batch re-encrypted {} file EDEK(s) to version '{}'", summary.reencrypted_files_count, summary.target_version),
                 "summary": summary
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": e.to_string() }))).into_response(),
     }
 }
 
@@ -827,15 +828,15 @@ async fn renew_tgt_handler(State(state): State<Arc<PortalState>>) -> impl IntoRe
                 &format!("Ticket renewed until {}", tgt.end_time),
                 vec!["kerberos", "kinit"],
             ).await;
-            Json(serde_json::json!({
+            (StatusCode::OK, Json(serde_json::json!({
                 "status": "success",
                 "message": format!("TGT acquired for {} expiring at {}", tgt.server, tgt.end_time)
-            }))
+            }))).into_response()
         }
-        Err(e) => Json(serde_json::json!({
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "status": "error",
             "message": e.to_string()
-        })),
+        }))).into_response(),
     }
 }
 
@@ -847,7 +848,7 @@ async fn list_tables_handler(State(state): State<Arc<PortalState>>) -> Json<Vec<
 async fn get_table_handler(
     State(state): State<Arc<PortalState>>,
     Query(query): Query<TableQuery>,
-) -> Result<Json<TableDetailResponse>, (axum::http::StatusCode, String)> {
+) -> Result<Json<TableDetailResponse>, (StatusCode, String)> {
     if let Some(metadata) = state.iceberg.get_table(&query.name).await {
         let manifest_list = metadata
             .snapshots
@@ -858,7 +859,7 @@ async fn get_table_handler(
 
         Ok(Json(TableDetailResponse { metadata, files }))
     } else {
-        Err((axum::http::StatusCode::NOT_FOUND, "Table not found".into()))
+        Err((StatusCode::NOT_FOUND, "Table not found".into()))
     }
 }
 
@@ -906,14 +907,14 @@ async fn trigger_dag_handler(
     );
 
     match dag.run().await {
-        Ok(_) => Json(serde_json::json!({
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({
             "status": "success",
             "message": format!("Task '{}' executed successfully", payload.task_name)
-        })),
-        Err(e) => Json(serde_json::json!({
+        }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "status": "error",
             "message": e
-        })),
+        }))).into_response(),
     }
 }
 
@@ -1412,6 +1413,12 @@ const PORTAL_HTML: &str = r#"
       const apps = await res.json();
       const tbody = document.querySelector('#sparkAppsTable tbody');
       tbody.innerHTML = '';
+
+      if (apps.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e;">No active Spark applications.</td></tr>';
+        return;
+      }
+
       apps.forEach(a => {
         const isRunning = a.status === 'RUNNING';
         tbody.innerHTML += `<tr>

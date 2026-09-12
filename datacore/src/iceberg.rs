@@ -183,34 +183,33 @@ impl IcebergCatalog {
         manifests.get(manifest_list).cloned().unwrap_or_default()
     }
 
+    /// Commits an Iceberg snapshot without holding locks across asynchronous I/O boundaries
     pub async fn commit_snapshot_to_hdfs(
         &self,
         table_name: &str,
         new_files: Vec<ManifestFileEntry>,
         operation: &str,
     ) -> Result<Snapshot, String> {
-        let mut tables = self.tables.write().await;
-        let mut manifests = self.manifests.write().await;
+        // Step 1: Read metadata under read lock to compute paths
+        let (location, parent_snapshot, next_meta_version, mut table_clone) = {
+            let tables = self.tables.read().await;
+            let table = tables
+                .get(table_name)
+                .ok_or_else(|| format!("Table '{table_name}' not found in catalog"))?;
+            (
+                table.location.clone(),
+                table.current_snapshot_id,
+                table.metadata_version + 1,
+                table.clone(),
+            )
+        };
 
-        let table = tables
-            .get_mut(table_name)
-            .ok_or_else(|| format!("Table '{table_name}' not found in catalog"))?;
-
-        let parent_snapshot = table.current_snapshot_id;
         let new_snapshot_id = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let now_ms = chrono::Utc::now().timestamp_millis();
         let total_added_records: i64 = new_files.iter().map(|f| f.record_count).sum();
 
-        let manifest_filename = format!("{}/metadata/snap-{}.avro", table.location, new_snapshot_id);
-        let next_meta_version = table.metadata_version + 1;
-        let metadata_filename = format!("{}/metadata/v{}.metadata.json", table.location, next_meta_version);
-
-        let manifest_json = serde_json::to_vec_pretty(&new_files)
-            .map_err(|e| format!("Failed to serialize manifest: {e}"))?;
-        self.hdfs
-            .write_file(&manifest_filename, manifest_json, true)
-            .await
-            .map_err(|e| format!("WebHDFS failed writing manifest: {e}"))?;
+        let manifest_filename = format!("{}/metadata/snap-{}.avro", location, new_snapshot_id);
+        let metadata_filename = format!("{}/metadata/v{}.metadata.json", location, next_meta_version);
 
         let mut summary = HashMap::new();
         summary.insert("operation".to_string(), operation.to_string());
@@ -226,20 +225,33 @@ impl IcebergCatalog {
             summary,
         };
 
-        table.snapshots.push(snapshot.clone());
-        table.current_snapshot_id = Some(new_snapshot_id);
-        table.last_updated_ms = now_ms;
-        table.metadata_version = next_meta_version;
+        table_clone.snapshots.push(snapshot.clone());
+        table_clone.current_snapshot_id = Some(new_snapshot_id);
+        table_clone.last_updated_ms = now_ms;
+        table_clone.metadata_version = next_meta_version;
 
-        let table_meta_bytes = serde_json::to_vec_pretty(&table)
+        // Step 2: Perform file serialization and WebHDFS network I/O WITHOUT holding catalog locks
+        let manifest_json = serde_json::to_vec_pretty(&new_files)
+            .map_err(|e| format!("Failed to serialize manifest: {e}"))?;
+        self.hdfs
+            .write_file(&manifest_filename, manifest_json, true)
+            .await
+            .map_err(|e| format!("WebHDFS failed writing manifest: {e}"))?;
+
+        let table_meta_bytes = serde_json::to_vec_pretty(&table_clone)
             .map_err(|e| format!("Failed to serialize table metadata: {e}"))?;
-
         self.hdfs
             .write_file(&metadata_filename, table_meta_bytes, true)
             .await
             .map_err(|e| format!("WebHDFS failed writing v{next_meta_version}.metadata.json: {e}"))?;
 
-        manifests.insert(manifest_filename, new_files);
+        // Step 3: Fast in-memory state update
+        {
+            let mut tables = self.tables.write().await;
+            let mut manifests = self.manifests.write().await;
+            tables.insert(table_name.to_string(), table_clone);
+            manifests.insert(manifest_filename, new_files);
+        }
 
         Ok(snapshot)
     }
@@ -253,14 +265,16 @@ impl IcebergCatalog {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let cutoff_time = now_ms - max_age_ms;
 
-        let mut tables = self.tables.write().await;
-        let mut manifests = self.manifests.write().await;
+        let (mut table_clone, current_manifests) = {
+            let tables = self.tables.read().await;
+            let manifests = self.manifests.read().await;
+            let table = tables
+                .get(table_name)
+                .ok_or_else(|| format!("Table '{table_name}' not found"))?;
+            (table.clone(), manifests.clone())
+        };
 
-        let table = tables
-            .get_mut(table_name)
-            .ok_or_else(|| format!("Table '{table_name}' not found"))?;
-
-        if table.snapshots.len() <= retain_last_n {
+        if table_clone.snapshots.len() <= retain_last_n {
             return Ok(CleanupReport {
                 table_name: table_name.to_string(),
                 expired_snapshots_count: 0,
@@ -268,17 +282,17 @@ impl IcebergCatalog {
                 deleted_manifest_files: vec![],
                 deleted_orphan_parquet_files: vec![],
                 reclaimed_bytes: 0,
-                new_metadata_version: table.metadata_version,
+                new_metadata_version: table_clone.metadata_version,
             });
         }
 
-        let total_snapshots = table.snapshots.len();
+        let total_snapshots = table_clone.snapshots.len();
         let split_idx = total_snapshots.saturating_sub(retain_last_n);
 
         let mut retained_snapshots = Vec::new();
         let mut expired_snapshots = Vec::new();
 
-        for (idx, snap) in table.snapshots.iter().enumerate() {
+        for (idx, snap) in table_clone.snapshots.iter().enumerate() {
             if idx < split_idx && snap.timestamp_ms < cutoff_time {
                 expired_snapshots.push(snap.clone());
             } else {
@@ -293,7 +307,7 @@ impl IcebergCatalog {
 
         for snap in &retained_snapshots {
             active_manifest_lists.insert(snap.manifest_list.clone());
-            if let Some(entries) = manifests.get(&snap.manifest_list) {
+            if let Some(entries) = current_manifests.get(&snap.manifest_list) {
                 for file_entry in entries {
                     active_parquet_data_files.insert(file_entry.file_path.clone());
                 }
@@ -304,12 +318,11 @@ impl IcebergCatalog {
         for snap in &expired_snapshots {
             if !active_manifest_lists.contains(&snap.manifest_list) {
                 let _ = self.hdfs.delete_file(&snap.manifest_list, false).await;
-                manifests.remove(&snap.manifest_list);
                 deleted_manifests.push(snap.manifest_list.clone());
             }
         }
 
-        let data_prefix = format!("{}/data", table.location);
+        let data_prefix = format!("{}/data", table_clone.location);
         let physical_files = self.hdfs.list_prefix(&data_prefix).await;
 
         let mut deleted_orphans = Vec::new();
@@ -325,19 +338,28 @@ impl IcebergCatalog {
             }
         }
 
-        table.snapshots = retained_snapshots;
-        table.last_updated_ms = now_ms;
-        let next_meta_version = table.metadata_version + 1;
-        table.metadata_version = next_meta_version;
+        table_clone.snapshots = retained_snapshots;
+        table_clone.last_updated_ms = now_ms;
+        let next_meta_version = table_clone.metadata_version + 1;
+        table_clone.metadata_version = next_meta_version;
 
-        let metadata_filename = format!("{}/metadata/v{}.metadata.json", table.location, next_meta_version);
-        let table_meta_bytes = serde_json::to_vec_pretty(&table)
+        let metadata_filename = format!("{}/metadata/v{}.metadata.json", table_clone.location, next_meta_version);
+        let table_meta_bytes = serde_json::to_vec_pretty(&table_clone)
             .map_err(|e| format!("Failed to serialize cleaned metadata: {e}"))?;
 
         self.hdfs
             .write_file(&metadata_filename, table_meta_bytes, true)
             .await
             .map_err(|e| format!("WebHDFS failed writing v{next_meta_version}.metadata.json: {e}"))?;
+
+        {
+            let mut tables = self.tables.write().await;
+            let mut manifests = self.manifests.write().await;
+            for m in &deleted_manifests {
+                manifests.remove(m);
+            }
+            tables.insert(table_name.to_string(), table_clone);
+        }
 
         Ok(CleanupReport {
             table_name: table_name.to_string(),
@@ -356,28 +378,27 @@ impl IcebergCatalog {
         _target_max_file_size_bytes: u64,
         small_file_threshold_bytes: u64,
     ) -> Result<CompactionReport, String> {
-        let mut tables = self.tables.write().await;
-        let mut manifests = self.manifests.write().await;
+        let (mut table_clone, current_files, current_snap_id) = {
+            let tables = self.tables.read().await;
+            let manifests = self.manifests.read().await;
+            let table = tables
+                .get(table_name)
+                .ok_or_else(|| format!("Table '{table_name}' not found"))?;
 
-        let table = tables
-            .get_mut(table_name)
-            .ok_or_else(|| format!("Table '{table_name}' not found"))?;
+            let current_snap_id = table
+                .current_snapshot_id
+                .ok_or_else(|| "Table has no active snapshot to compact".to_string())?;
 
-        let current_snap_id = table
-            .current_snapshot_id
-            .ok_or_else(|| "Table has no active snapshot to compact".to_string())?;
+            let manifest_list_path = table
+                .snapshots
+                .iter()
+                .find(|s| s.snapshot_id == current_snap_id)
+                .map(|s| s.manifest_list.clone())
+                .ok_or_else(|| "Active manifest list not found".to_string())?;
 
-        let manifest_list_path = table
-            .snapshots
-            .iter()
-            .find(|s| s.snapshot_id == current_snap_id)
-            .map(|s| s.manifest_list.clone())
-            .ok_or_else(|| "Active manifest list not found".to_string())?;
-
-        let current_files = manifests
-            .get(&manifest_list_path)
-            .cloned()
-            .unwrap_or_default();
+            let current_files = manifests.get(&manifest_list_path).cloned().unwrap_or_default();
+            (table.clone(), current_files, current_snap_id)
+        };
 
         if current_files.len() < 2 {
             return Err("Table does not contain enough small files to require compaction".to_string());
@@ -436,7 +457,7 @@ impl IcebergCatalog {
         let compacted_file_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let compacted_file_path = format!(
             "{}/data/compacted-part-{}-{}.parquet",
-            table.location, partition_dt, compacted_file_id
+            table_clone.location, partition_dt, compacted_file_id
         );
 
         let compacted_bytes = self
@@ -461,7 +482,7 @@ impl IcebergCatalog {
 
         let new_snapshot_id = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let new_manifest_path = format!("{}/metadata/snap-{}.avro", table.location, new_snapshot_id);
+        let new_manifest_path = format!("{}/metadata/snap-{}.avro", table_clone.location, new_snapshot_id);
 
         let manifest_bytes = serde_json::to_vec_pretty(&retained_files)
             .map_err(|e| format!("Serialization error: {e}"))?;
@@ -485,14 +506,14 @@ impl IcebergCatalog {
             summary,
         };
 
-        table.snapshots.push(snapshot);
-        table.current_snapshot_id = Some(new_snapshot_id);
-        table.last_updated_ms = now_ms;
-        let next_meta_version = table.metadata_version + 1;
-        table.metadata_version = next_meta_version;
+        table_clone.snapshots.push(snapshot);
+        table_clone.current_snapshot_id = Some(new_snapshot_id);
+        table_clone.last_updated_ms = now_ms;
+        let next_meta_version = table_clone.metadata_version + 1;
+        table_clone.metadata_version = next_meta_version;
 
-        let metadata_filename = format!("{}/metadata/v{}.metadata.json", table.location, next_meta_version);
-        let meta_bytes = serde_json::to_vec_pretty(&table)
+        let metadata_filename = format!("{}/metadata/v{}.metadata.json", table_clone.location, next_meta_version);
+        let meta_bytes = serde_json::to_vec_pretty(&table_clone)
             .map_err(|e| format!("Table metadata serialization error: {e}"))?;
 
         self.hdfs
@@ -500,7 +521,12 @@ impl IcebergCatalog {
             .await
             .map_err(|e| format!("WebHDFS metadata write error: {e}"))?;
 
-        manifests.insert(new_manifest_path, retained_files);
+        {
+            let mut tables = self.tables.write().await;
+            let mut manifests = self.manifests.write().await;
+            tables.insert(table_name.to_string(), table_clone);
+            manifests.insert(new_manifest_path, retained_files);
+        }
 
         Ok(CompactionReport {
             table_name: table_name.to_string(),
