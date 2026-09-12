@@ -16,7 +16,10 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.8", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+
+# Pin chrono to 0.4.38 to prevent .quarter() collision in arrow-arith 51.0
+chrono = { version = "=0.4.38", features = ["serde"] }
+
 byteorder = "1.5"
 rand = "0.8"
 
