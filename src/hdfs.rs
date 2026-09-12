@@ -17,6 +17,8 @@ pub enum HdfsError {
     Api(StatusCode, String),
     #[error("Parquet encode/decode error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
     #[error("File not found: {0}")]
     NotFound(String),
 }
