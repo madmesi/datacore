@@ -4,7 +4,6 @@ use parquet::arrow::ArrowWriter;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -90,7 +89,7 @@ impl WebHdfsClient {
         &self,
         path: &str,
         data: Vec<u8>,
-        overwrite: bool,
+        _overwrite: bool,
         do_as_user: Option<&str>,
     ) -> Result<String, HdfsError> {
         let clean_path = path.trim_start_matches('/');
@@ -184,8 +183,8 @@ impl WebHdfsClient {
 
     pub async fn read_parquet_as(&self, path: &str, do_as_user: Option<&str>) -> Result<Vec<RecordBatch>, HdfsError> {
         let parquet_bytes = self.read_file_as(path, do_as_user).await?;
-        let cursor = Cursor::new(parquet_bytes);
-        let reader = ParquetRecordBatchReaderBuilder::try_new(cursor)?.build()?;
+        let bytes_data = bytes::Bytes::from(parquet_bytes);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes_data)?.build()?;
 
         let mut batches = Vec::new();
         for batch_result in reader {

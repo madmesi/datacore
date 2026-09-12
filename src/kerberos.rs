@@ -6,10 +6,10 @@ use tokio::sync::RwLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EncryptionType {
-    Aes256CtsHmacSha196 = 18,
-    Aes128CtsHmacSha196 = 17,
-    ArcfourHmac = 23,
-    Des3CbcSha1 = 16,
+    Aes256CtsHmacSha196,
+    Aes128CtsHmacSha196,
+    ArcfourHmac,
+    Des3CbcSha1,
     Unknown(i16),
 }
 

@@ -20,7 +20,8 @@ use crate::ldap::LdapUserRecord;
 use crate::security::SecurityKernel;
 use crate::sql_engine::SqlEngine;
 use crate::telemetry::MetricsCollector;
-use crate::workflow::{DagEngine, SparkSubmitTask};
+use crate::compute::SparkSubmitTask;
+use crate::workflow::DagEngine;
 
 #[derive(Serialize)]
 struct SystemStatus {
@@ -162,7 +163,7 @@ pub async fn launch_portal(port: u16) -> Result<(), Box<dyn std::error::Error>> 
     let iceberg = Arc::new(IcebergCatalog::new(hdfs.clone()));
     let sql_engine = Arc::new(SqlEngine::new(iceberg.clone(), telemetry.clone()).await?);
     let py4j = Arc::new(crate::py4j_bridge::Py4jGatewayServer::new(25333));
-    py4j.start_listener().await?;
+    py4j.start_listener().await.map_err(|e| e.to_string())?;
 
     let tsdb_clone = grafana_tsdb.clone();
     tokio::spawn(async move {
