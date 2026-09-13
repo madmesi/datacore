@@ -29,11 +29,12 @@ impl SqlEngine {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let ctx = SessionContext::new();
 
+        // FIX: Timezone set to `None` to strictly match the underlying Arrow array data
         let schema = Arc::new(Schema::new(vec![
             Field::new("event_id", DataType::Int64, false),
             Field::new(
                 "timestamp",
-                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Millisecond, None), 
                 false,
             ),
             Field::new("service_name", DataType::Utf8, false),
